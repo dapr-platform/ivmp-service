@@ -1,0 +1,94 @@
+package service
+
+import (
+	"encoding/base64"
+	"io/ioutil"
+	"os"
+	"testing"
+	"time"
+)
+
+func TestProcessImg(t *testing.T) {
+	// Prepare a sample image (you can use any valid image)
+	imgFile := "../test/bus.jpg"
+	imgBytes, err := os.ReadFile(imgFile)
+	if err != nil {
+		t.Fatalf("failed to read image file: %v", err)
+	}
+	imgBase64 := base64.StdEncoding.EncodeToString(imgBytes)
+
+	modelName := "yolov5x6u"
+	resultImg, result, err := processImg(imgBase64, modelName)
+	if err != nil {
+		t.Fatalf("processImg returned an error: %v", err)
+	}
+	if resultImg == "" {
+		t.Fatal("expected a non-empty result image")
+	}
+	if len(result) == 0 {
+		t.Fatal("expected non-empty result list")
+	}
+
+	// Check results (e.g., validate bounding boxes, class names)
+	// Here you would add specific checks based on your model output
+}
+func TestProcessImg_InvalidModel(t *testing.T) {
+	imgFile := "sample.jpg"
+	imgBytes, err := ioutil.ReadFile(imgFile)
+	if err != nil {
+		t.Fatalf("failed to read image file: %v", err)
+	}
+	imgBase64 := base64.StdEncoding.EncodeToString(imgBytes)
+
+	invalidModelName := "invalid_model"
+	_, _, err = processImg(imgBase64, invalidModelName)
+	if err == nil {
+		t.Fatal("expected an error for invalid model")
+	}
+}
+func TestProcessStream(t *testing.T) {
+	streamUrl := "sample_stream.mp4"               // Provide a path to a sample video file
+	outStreamUrl := "rtmp://localhost/live/stream" // Mock URL for testing purposes
+	modelName := "yolov3"
+
+	results := make(chan string)
+	go func() {
+		err := processStream(streamUrl, "test_stream_id", modelName, outStreamUrl, results)
+		if err != nil {
+			t.Fatalf("processStream returned an error: %v", err)
+		}
+	}()
+
+	// Expect results
+	select {
+	case result := <-results:
+		if result == "" {
+			t.Fatal("expected non-empty result")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for results")
+	}
+}
+
+// Note: For actual stream testing, you may need to use mocking frameworks or setup a test environment with RTMP server.
+
+func TestProcessStream_InvalidModel(t *testing.T) {
+	streamUrl := "sample_stream.mp4"
+	outStreamUrl := "rtmp://localhost/live/stream"
+	invalidModelName := "invalid_model"
+
+	results := make(chan string)
+	go func() {
+		err := processStream(streamUrl, "test_stream_id", invalidModelName, outStreamUrl, results)
+		if err == nil {
+			t.Fatal("expected an error for invalid model")
+		}
+	}()
+
+	select {
+	case <-results:
+		t.Fatal("expected no results due to model error")
+	case <-time.After(10 * time.Second):
+		// Expecting an error, so no result should be returned.
+	}
+}

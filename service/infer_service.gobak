@@ -1,0 +1,395 @@
+package service
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/spf13/cast"
+	"gocv.io/x/gocv"
+	"image"
+	"image/color"
+	"log"
+	"os"
+	"os/exec"
+	"sync"
+	"time"
+)
+
+var (
+	imgNet         = make(map[string]*gocv.Net) // Map for image processing models
+	streamNet      = make(map[string]*gocv.Net) // Map for stream processing models
+	imgLastUsed    = make(map[string]time.Time) // Map for tracking last used time for image models
+	streamLastUsed = make(map[string]time.Time) // Map for tracking last used time for stream models
+	imgNetMutex    sync.Mutex
+	streamNetMutex sync.Mutex
+	stopChannels   = make(map[string]chan struct{})
+	stopMutex      sync.Mutex
+	cacheDuration  = 10 * time.Minute // Duration after which the model should be destroyed if not used
+	imgSize        = 1280
+)
+
+// Result holds the detection results
+type Result struct {
+	ClassID    int             `json:"class_id"`
+	ClassName  string          `json:"class_name"`
+	Confidence float32         `json:"confidence"`
+	Box        image.Rectangle `json:"box"`
+}
+
+// FrameStack holds frames for processing
+type FrameStack struct {
+	frames []gocv.Mat
+	mu     sync.Mutex
+}
+
+// Push a frame onto the stack
+func (fs *FrameStack) Push(frame gocv.Mat) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.frames = append(fs.frames, frame)
+}
+
+// Pop the most recent frame from the stack
+func (fs *FrameStack) Pop() (gocv.Mat, bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if len(fs.frames) == 0 {
+		return gocv.Mat{}, false
+	}
+	frame := fs.frames[len(fs.frames)-1]
+	fs.frames = fs.frames[:len(fs.frames)-1]
+	return frame, true
+}
+
+// Truncate the stack to retain only the most recent frame
+func (fs *FrameStack) Truncate() {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if len(fs.frames) > 1 {
+		fs.frames = fs.frames[len(fs.frames)-1:]
+	}
+}
+
+const defaultModelFolder = "../ai_models"
+
+func loadClassNames(modelName string) (map[string]string, error) {
+	jsonFile := fmt.Sprintf("%s/%s.json", defaultModelFolder, modelName)
+	file, err := os.Open(jsonFile)
+	if err != nil {
+		return nil, fmt.Errorf("could not open class names file: %w", err)
+	}
+	defer file.Close()
+
+	var names map[string]string
+	if err := json.NewDecoder(file).Decode(&names); err != nil {
+		return nil, fmt.Errorf("could not decode class names file: %w", err)
+	}
+	return names, nil
+}
+
+// Get or create the cached YOLO model for image processing
+func getImgNet(modelName string) (*gocv.Net, map[string]string, error) {
+	imgNetMutex.Lock()
+	defer imgNetMutex.Unlock()
+
+	if net, exists := imgNet[modelName]; exists && time.Since(imgLastUsed[modelName]) < cacheDuration {
+		imgLastUsed[modelName] = time.Now()
+		classNames, err := loadClassNames(modelName)
+		return net, classNames, err
+	}
+	if net, exists := imgNet[modelName]; exists {
+		log.Printf("Image net model %s is expired. Closing old model.", modelName)
+		net.Close()
+	}
+	net := gocv.ReadNetFromONNX(fmt.Sprintf("%s/%s.onnx", defaultModelFolder, modelName))
+	if net.Empty() {
+		return nil, nil, errors.New("could not load the model")
+	}
+	imgNet[modelName] = &net
+	imgLastUsed[modelName] = time.Now()
+	classNames, err := loadClassNames(modelName)
+	return &net, classNames, err
+}
+func getStreamNet(modelName, id string) (*gocv.Net, map[string]string, error) {
+	streamNetMutex.Lock()
+	defer streamNetMutex.Unlock()
+
+	netKey := modelName + "_" + id
+	if net, exists := streamNet[netKey]; exists && time.Since(streamLastUsed[netKey]) < cacheDuration {
+		streamLastUsed[netKey] = time.Now()
+		classNames, err := loadClassNames(modelName)
+		return net, classNames, err
+	}
+
+	if net, exists := streamNet[netKey]; exists {
+		net.Close()
+	}
+	net := gocv.ReadNetFromONNX(fmt.Sprintf("%s/%s.onnx", defaultModelFolder, modelName))
+	if net.Empty() {
+		return nil, nil, errors.New("could not load the model")
+	}
+	streamNet[netKey] = &net
+	streamLastUsed[netKey] = time.Now()
+	classNames, err := loadClassNames(modelName)
+	return &net, classNames, err
+}
+
+// Process an image and return the annotated image and results
+func processImg(imgBase64 string, modelName string) (resultImg string, result []Result, err error) {
+	// Decode the Base64 image
+	imgBytes, err := base64.StdEncoding.DecodeString(imgBase64)
+	if err != nil {
+		log.Printf("Failed to decode base64 image: %v", err)
+		return "", nil, err
+	}
+
+	img, err := gocv.IMDecode(imgBytes, gocv.IMReadColor)
+	if err != nil || img.Empty() {
+		log.Printf("Failed to decode image or image is empty.")
+		return "", nil, errors.New("could not decode image")
+	}
+	defer img.Close()
+
+	// Load YOLO model
+	net, classNames, err := getImgNet(modelName)
+	if err != nil {
+		return "", nil, err
+	}
+	defer net.Close()
+
+	// Create a blob from the image and set it as the input to the network
+	blob := gocv.BlobFromImage(img, 1.0/255.0, image.Pt(imgSize, imgSize), gocv.NewScalar(0, 0, 0, 0), true, false)
+	defer blob.Close()
+
+	net.SetInput(blob, "")
+
+	// Forward pass to get output from the YOLO model
+	output := net.Forward("")
+	defer output.Close()
+
+	var textResults []Result
+	for i := 0; i < output.Rows(); i++ {
+		confidence := output.GetFloatAt(i, 4)
+		if confidence > 0.5 {
+			classID := int(output.GetFloatAt(i, 1))
+			left := int(output.GetFloatAt(i, 0) * float32(img.Cols()))
+			top := int(output.GetFloatAt(i, 1) * float32(img.Rows()))
+			right := int(output.GetFloatAt(i, 2) * float32(img.Cols()))
+			bottom := int(output.GetFloatAt(i, 3) * float32(img.Rows()))
+
+			// Draw the bounding box
+			rect := image.Rect(left, top, right, bottom)
+			gocv.Rectangle(&img, rect, color.RGBA{0, 255, 0, 0}, 2)
+
+			// Add text label
+			className := classNames[cast.ToString(classID)]
+			gocv.PutText(&img, fmt.Sprintf("%s: %.2f", className, confidence), image.Pt(left, top-10), gocv.FontHersheySimplex, 0.5, color.RGBA{255, 0, 0, 0}, 2)
+
+			// Append to results
+			textResults = append(textResults, Result{
+				ClassID:    classID,
+				ClassName:  className,
+				Confidence: confidence,
+				Box:        rect,
+			})
+		}
+	}
+
+	// Encode the processed image to JPEG format
+	buf, err := gocv.IMEncode(".jpg", img)
+	if err != nil {
+		log.Printf("Failed to encode image to JPEG: %v", err)
+		return "", nil, err
+	}
+	defer buf.Close()
+
+	// Convert the JPEG image to Base64
+	resultImg = base64.StdEncoding.EncodeToString(buf.GetBytes())
+
+	return resultImg, textResults, nil
+}
+
+// Helper function to get the class name from a class ID
+func getClassName(classID int) string {
+	// This function should map class IDs to human-readable class names.
+	// The actual implementation will depend on your specific model.
+	// Here's an example placeholder:
+	classNames := map[int]string{
+		0: "person",
+		1: "bicycle",
+		2: "car",
+		// Add more mappings as needed
+	}
+	if name, ok := classNames[classID]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+// Process video stream and send annotated frames to another RTMP stream
+func processStream(streamUrl string, id, modelName string, outStreamUrl string, results chan<- string) error {
+	// Open the video stream
+	video, err := gocv.VideoCaptureFile(streamUrl)
+	if err != nil {
+		log.Printf("Failed to open video stream %s: %v", streamUrl, err)
+		return err
+	}
+	defer video.Close()
+
+	// Load YOLO model
+	net, classNames, err := getStreamNet(modelName, id)
+	if err != nil {
+		return err
+	}
+	defer net.Close()
+
+	// Get video properties
+	fps := video.Get(gocv.VideoCaptureFPS)
+
+	// Prepare ffmpeg command for streaming
+	ffmpegCmd := exec.Command("ffmpeg",
+		"-y",
+		"-f", "image2pipe",
+		"-vcodec", "mjpeg",
+		"-r", fmt.Sprintf("%d", int(fps)),
+		"-i", "pipe:0",
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-f", "flv",
+		outStreamUrl)
+
+	ffmpegStdin, err := ffmpegCmd.StdinPipe()
+	if err != nil {
+		log.Printf("Failed to get ffmpeg stdin pipe: %v", err)
+		return err
+	}
+
+	// Start the ffmpeg process
+	if err := ffmpegCmd.Start(); err != nil {
+		log.Printf("Failed to start ffmpeg process: %v", err)
+		return err
+	}
+	defer ffmpegStdin.Close()
+
+	frameStack := &FrameStack{frames: []gocv.Mat{}}
+	var wg sync.WaitGroup
+
+	// Producer: Read frames from the video stream
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		frame := gocv.NewMat()
+		defer frame.Close()
+		for {
+			if ok := video.Read(&frame); !ok || frame.Empty() {
+				log.Printf("Failed to read frame or frame is empty.")
+				break
+			}
+			select {
+			case <-getStopChannel(id):
+				log.Printf("Stopping video stream processing for ID %s.", id)
+				return
+			default:
+				frameStack.Push(frame.Clone())
+				frameStack.Truncate() // Keep only the latest frame
+			}
+		}
+	}()
+
+	// Consumer: Process the latest frame from the stack
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-getStopChannel(id):
+				log.Printf("Stopping frame processing for ID %s.", id)
+				return
+			default:
+				frame, ok := frameStack.Pop()
+				if !ok {
+					continue
+				}
+
+				// Lock the net to ensure thread-safe access
+				streamNetMutex.Lock()
+				blob := gocv.BlobFromImage(frame, 1.0/255.0, image.Pt(imgSize, imgSize), gocv.NewScalar(0, 0, 0, 0), true, false)
+				defer blob.Close()
+				net.SetInput(blob, "")
+
+				// Forward pass to get output from the YOLO model
+				output := net.Forward("")
+				defer output.Close()
+
+				var textResults []string
+				for i := 0; i < output.Rows(); i++ {
+					confidence := output.GetFloatAt(i, 4)
+					if confidence > 0.5 {
+						classID := int(output.GetFloatAt(i, 1))
+						left := int(output.GetFloatAt(i, 0) * float32(frame.Cols()))
+						top := int(output.GetFloatAt(i, 1) * float32(frame.Rows()))
+						right := int(output.GetFloatAt(i, 2) * float32(frame.Cols()))
+						bottom := int(output.GetFloatAt(i, 3) * float32(frame.Rows()))
+
+						// Draw the bounding box
+						rect := image.Rect(left, top, right, bottom)
+						gocv.Rectangle(&frame, rect, color.RGBA{0, 255, 0, 0}, 2)
+
+						// Add text label
+						className := classNames[cast.ToString(classID)]
+						gocv.PutText(&frame, fmt.Sprintf("%s: %.2f", className, confidence), image.Pt(left, top-10), gocv.FontHersheySimplex, 0.5, color.RGBA{255, 0, 0, 0}, 2)
+
+						// Append to results
+						textResults = append(textResults, fmt.Sprintf("%s: %.2f", className, confidence))
+					}
+				}
+
+				// Convert frame to JPEG format and write to ffmpeg stdin
+				buf, err := gocv.IMEncode(".jpg", frame)
+				if err != nil {
+					results <- fmt.Sprintf("Failed to encode frame: %v", err)
+					return
+				}
+				defer buf.Close()
+
+				if _, err := ffmpegStdin.Write(buf.GetBytes()); err != nil {
+					results <- fmt.Sprintf("Failed to write to ffmpeg stdin: %v", err)
+					return
+				}
+
+				// Send results to channel
+				results <- fmt.Sprintf("Frame processed: %v", textResults)
+			}
+		}
+	}()
+
+	wg.Wait()
+	if err := ffmpegCmd.Wait(); err != nil {
+		log.Printf("FFmpeg process exited with error: %v", err)
+		return err
+	}
+	return nil
+}
+
+// Get or create a stopping channel for a specific stream ID
+func getStopChannel(id string) chan struct{} {
+	stopMutex.Lock()
+	defer stopMutex.Unlock()
+	if ch, exists := stopChannels[id]; exists {
+		return ch
+	}
+	ch := make(chan struct{})
+	stopChannels[id] = ch
+	return ch
+}
+
+// Stop the processing of a specific stream by ID
+func stopStream(id string) {
+	stopMutex.Lock()
+	defer stopMutex.Unlock()
+	if ch, exists := stopChannels[id]; exists {
+		close(ch)
+		delete(stopChannels, id)
+	}
+}

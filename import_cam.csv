@@ -1,0 +1,2 @@
+﻿标识,名称,IP,流类型(rtsp/rtmp),流端口,用户名,密码,流路径,第二流路径
+test1,test1,192.168.2.87,rtsp,554,admin,admin,/stream,
